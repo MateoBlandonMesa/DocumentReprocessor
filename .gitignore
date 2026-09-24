@@ -10,6 +10,6 @@
 **/obj/
 **/publish/
 
-# Local secrets — keep appsettings.Example.json in source control
+# Local secrets — keep DocumentReprocessor/appsettings.Example.json in source control
 DocumentReprocessor/appsettings.json
 DocumentReprocessor/appsettings.Development.json
