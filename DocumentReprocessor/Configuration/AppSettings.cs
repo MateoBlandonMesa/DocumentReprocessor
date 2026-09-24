@@ -7,6 +7,7 @@ public sealed class AppSettings
 {
     public ApiSettings Api { get; set; } = new();
     public PathSettings Paths { get; set; } = new();
+    public ProcessingSettings Processing { get; set; } = new();
 }
 
 /// <summary>
@@ -60,4 +61,31 @@ public sealed class PathSettings
     /// Folder where the Excel run report is written. Falls back to LogFolder when empty.
     /// </summary>
     public string ReportFolder { get; set; } = string.Empty;
+}
+
+/// <summary>
+/// Parallel processing and retry settings.
+/// </summary>
+public sealed class ProcessingSettings
+{
+    /// <summary>
+    /// Maximum number of documents sent at the same time.
+    /// Use 1 for sequential processing. Default 20 (suited for ~1000 requests/minute capacity).
+    /// </summary>
+    public int MaxDegreeOfParallelism { get; set; } = 20;
+
+    /// <summary>
+    /// Extra attempts after the first failure for transient errors (429, 503, timeouts).
+    /// </summary>
+    public int MaxRetryAttempts { get; set; } = 3;
+
+    /// <summary>
+    /// Base delay in milliseconds before a retry. Actual delay grows with attempt number.
+    /// </summary>
+    public int RetryBaseDelayMilliseconds { get; set; } = 3000;
+
+    /// <summary>
+    /// HttpClient timeout in seconds for each API call.
+    /// </summary>
+    public int HttpTimeoutSeconds { get; set; } = 45;
 }

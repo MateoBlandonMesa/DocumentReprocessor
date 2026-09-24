@@ -14,6 +14,7 @@ public sealed class JsonFileLogger
     };
 
     private readonly string _logFolder;
+    private readonly object _pathLock = new();
 
     public JsonFileLogger(string logFolder)
     {
@@ -28,17 +29,38 @@ public sealed class JsonFileLogger
     {
         Directory.CreateDirectory(_logFolder);
 
-        var timestamp = entry.Timestamp.ToString("yyyyMMdd_HHmmss");
-        var nitPart = SanitizeForFileName(entry.CompanyNit) ?? "SIN_NIT";
-        var documentPart = SanitizeForFileName(entry.DocumentNumber)
-            ?? SanitizeForFileName(Path.GetFileNameWithoutExtension(entry.FileName))
-            ?? "unknown";
-
-        var logFileName = $"{timestamp}_{nitPart}_{documentPart}.json";
-        var logPath = Path.Combine(_logFolder, logFileName);
+        var logPath = ReserveUniqueLogPath(entry);
 
         await using var stream = File.Create(logPath);
         await JsonSerializer.SerializeAsync(stream, entry, SerializerOptions, cancellationToken);
+    }
+
+    private string ReserveUniqueLogPath(DocumentLogEntry entry)
+    {
+        lock (_pathLock)
+        {
+            var timestamp = entry.Timestamp.ToString("yyyyMMdd_HHmmss");
+            var nitPart = SanitizeForFileName(entry.CompanyNit) ?? "SIN_NIT";
+            var documentPart = SanitizeForFileName(entry.DocumentNumber)
+                ?? SanitizeForFileName(Path.GetFileNameWithoutExtension(entry.FileName))
+                ?? "unknown";
+
+            var logPath = Path.Combine(_logFolder, $"{timestamp}_{nitPart}_{documentPart}.json");
+            if (!File.Exists(logPath))
+            {
+                return logPath;
+            }
+
+            var counter = 1;
+            do
+            {
+                logPath = Path.Combine(_logFolder, $"{timestamp}_{nitPart}_{documentPart}_{counter}.json");
+                counter++;
+            }
+            while (File.Exists(logPath));
+
+            return logPath;
+        }
     }
 
     private static string? SanitizeForFileName(string? value)

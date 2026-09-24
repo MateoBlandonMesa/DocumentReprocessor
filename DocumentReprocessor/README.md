@@ -1,6 +1,6 @@
 # DocumentReprocessor
 
-Programa de consola en **C# / .NET 10** que toma archivos `.txt` de una carpeta configurable, los envía uno a uno al endpoint de NumRot (SendDIAN ENR PDF) y registra el resultado en logs JSON. Los archivos enviados correctamente se mueven a una carpeta de procesados.
+Programa de consola en **C# / .NET 10** que toma archivos `.txt` de una carpeta configurable, los envía al endpoint de NumRot (SendDIAN ENR PDF) —en paralelo de forma configurable— y registra el resultado en logs JSON y un Excel por corrida. Los archivos enviados correctamente se mueven a una carpeta de procesados.
 
 ## Requisitos
 
@@ -27,6 +27,12 @@ Ese archivo **no se versiona** (está en `.gitignore` porque contiene el token).
     "ProcessedFolder": "C:\\Documentos\\Procesados",
     "LogFolder": "C:\\Documentos\\Logs",
     "ReportFolder": "C:\\Documentos\\Logs\\Reportes"
+  },
+  "Processing": {
+    "MaxDegreeOfParallelism": 20,
+    "MaxRetryAttempts": 3,
+    "RetryBaseDelayMilliseconds": 3000,
+    "HttpTimeoutSeconds": 45
   }
 }
 ```
@@ -41,6 +47,10 @@ Ese archivo **no se versiona** (está en `.gitignore` porque contiene el token).
 | `Paths:ProcessedFolder` | Carpeta destino de los archivos enviados correctamente |
 | `Paths:LogFolder` | Carpeta donde se escriben los logs JSON |
 | `Paths:ReportFolder` | Carpeta del Excel por corrida. Si se omite, usa `LogFolder` |
+| `Processing:MaxDegreeOfParallelism` | Máximo de documentos enviados **a la vez** (no son lotes). `1` = secuencial. Default `20` |
+| `Processing:MaxRetryAttempts` | Reintentos extra ante errores transitorios (429, 503, timeouts) |
+| `Processing:RetryBaseDelayMilliseconds` | Espera base entre reintentos (crece con cada intento) |
+| `Processing:HttpTimeoutSeconds` | Timeout HTTP por petición |
 
 ## Cómo ejecutar
 
@@ -67,12 +77,22 @@ Antes de ejecutar:
 ## Flujo de trabajo
 
 1. Lee todos los `.txt` de la carpeta de entrada (solo el primer nivel).
-2. Por cada archivo, hace un `POST` con el **contenido completo del archivo** como body, `Content-Type: text/plain` y autenticación `Bearer`.
+2. Por cada archivo, hace un `POST` con el **contenido completo del archivo** como body, `Content-Type: text/plain` y autenticación `Bearer`. Hasta `MaxDegreeOfParallelism` documentos se envían al mismo tiempo.
 3. Extrae el número de documento (`FAD05`), el NIT (`FAJ21`), la fecha (`FAD09`) y la hora (`FAD10`) para trazabilidad.
 4. Escribe un log JSON con fecha/hora de proceso, NIT, `FAD05`, fecha/hora del documento, código HTTP, mensaje completo de la API (`StatusMessage` / `StatusDescription`), cuerpo de respuesta y resultado.
 5. Si la respuesta HTTP es exitosa (2xx), mueve el archivo a `ProcessedFolder` con fecha/hora en el nombre (por ejemplo `factura_20260924_093015.txt`) para no sobrescribir versiones anteriores.
-6. Si falla, el archivo **permanece** en la carpeta de entrada para reintento posterior.
-7. Al final de la corrida genera un Excel (`RunReport_yyyyMMdd_HHmmss.xlsx`) con todos los documentos de esa ejecución.
+6. Si falla, el archivo **permanece** en la carpeta de entrada; el resto del lote **sigue** procesándose. Ante 429/503/timeouts se reintenta según configuración.
+7. Al final de la corrida genera un Excel (`RunReport_yyyyMMdd_HHmmss.xlsx`) con todos los documentos de esa ejecución (ordenado por nombre de archivo).
+
+## Envío paralelo
+
+`MaxDegreeOfParallelism` limita cuántas peticiones pueden estar **en vuelo** a la vez (no divide en lotes fijos).
+
+Con capacidad del API de ~1000 req/min, `20` es un valor inicial razonable. Ajusta según el tiempo real de cada respuesta:
+
+`MaxDegreeOfParallelism ≈ (1000 / 60) × segundos_por_request` (dejando margen).
+
+Usa `1` si quieres volver al modo secuencial.
 
 ## Reporte Excel por corrida
 

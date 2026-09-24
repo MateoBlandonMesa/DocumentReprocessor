@@ -1,25 +1,31 @@
+using System.Collections.Concurrent;
 using DocumentReprocessor.Configuration;
 using DocumentReprocessor.Models;
 
 namespace DocumentReprocessor.Services;
 
 /// <summary>
-/// Orchestrates reading .txt files, sending them to the API, logging results, and moving processed files.
+/// Orchestrates reading .txt files, sending them to the API (optionally in parallel),
+/// logging results, and moving processed files.
 /// </summary>
 public sealed class DocumentProcessor
 {
     private readonly PathSettings _paths;
+    private readonly ProcessingSettings _processing;
     private readonly DianApiClient _apiClient;
     private readonly JsonFileLogger _logger;
     private readonly ExcelRunReportWriter _excelReportWriter;
+    private readonly object _processedPathLock = new();
 
     public DocumentProcessor(
         PathSettings paths,
+        ProcessingSettings processing,
         DianApiClient apiClient,
         JsonFileLogger logger,
         ExcelRunReportWriter excelReportWriter)
     {
         _paths = paths;
+        _processing = processing;
         _apiClient = apiClient;
         _logger = logger;
         _excelReportWriter = excelReportWriter;
@@ -33,7 +39,7 @@ public sealed class DocumentProcessor
         EnsureFoldersExist();
 
         var runStartedAt = DateTime.Now;
-        var runEntries = new List<DocumentLogEntry>();
+        var runEntries = new ConcurrentBag<DocumentLogEntry>();
 
         var files = Directory.GetFiles(_paths.InputFolder, "*.txt", SearchOption.TopDirectoryOnly)
             .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
@@ -45,25 +51,40 @@ public sealed class DocumentProcessor
             return new ProcessingRunResult(0, 0, null);
         }
 
+        var maxParallelism = Math.Max(1, _processing.MaxDegreeOfParallelism);
         Console.WriteLine($"Found {files.Length} file(s) to process.");
+        Console.WriteLine($"MaxDegreeOfParallelism: {maxParallelism}");
 
         var successCount = 0;
 
-        foreach (var filePath in files)
+        var parallelOptions = new ParallelOptions
         {
-            var entry = await ProcessFileAsync(filePath, cancellationToken);
+            MaxDegreeOfParallelism = maxParallelism,
+            CancellationToken = cancellationToken
+        };
+
+        await Parallel.ForEachAsync(files, parallelOptions, async (filePath, ct) =>
+        {
+            // One failure must not cancel the rest of the batch.
+            var entry = await ProcessFileAsync(filePath, ct);
             runEntries.Add(entry);
 
             if (entry.Success)
             {
-                successCount++;
+                Interlocked.Increment(ref successCount);
             }
-        }
+        });
+
+        // Stable order for the Excel report (processing order is non-deterministic when parallel).
+        var orderedEntries = runEntries
+            .OrderBy(e => e.FileName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(e => e.Timestamp)
+            .ToList();
 
         string? reportPath = null;
         try
         {
-            reportPath = _excelReportWriter.Write(runEntries, runStartedAt);
+            reportPath = _excelReportWriter.Write(orderedEntries, runStartedAt);
             if (reportPath is not null)
             {
                 Console.WriteLine($"Excel report: {reportPath}");
@@ -87,7 +108,7 @@ public sealed class DocumentProcessor
             SourcePath = filePath
         };
 
-        Console.WriteLine($"Processing: {fileName}");
+        WriteTrace(entry, $"Processing: {fileName}");
 
         try
         {
@@ -97,21 +118,19 @@ public sealed class DocumentProcessor
             entry.CompanyNit = EnrDocumentParser.ExtractCompanyNit(content);
             entry.DocumentDate = EnrDocumentParser.ExtractDocumentDate(content);
             entry.DocumentTime = EnrDocumentParser.ExtractDocumentTime(content);
-            Console.WriteLine($"  DocumentNumber (FAD05): {entry.DocumentNumber ?? "(not found)"}");
-            Console.WriteLine($"  CompanyNit (FAJ21): {entry.CompanyNit ?? "(not found)"}");
-            Console.WriteLine($"  DocumentDate (FAD09): {entry.DocumentDate ?? "(not found)"}");
-            Console.WriteLine($"  DocumentTime (FAD10): {entry.DocumentTime ?? "(not found)"}");
+
+            WriteTrace(entry, $"FAD05={entry.DocumentNumber ?? "n/a"} | FAJ21={entry.CompanyNit ?? "n/a"} | FAD09={entry.DocumentDate ?? "n/a"} | FAD10={entry.DocumentTime ?? "n/a"}");
 
             if (string.IsNullOrWhiteSpace(content))
             {
                 entry.Success = false;
                 entry.ErrorMessage = "File is empty.";
                 await _logger.WriteAsync(entry, cancellationToken);
-                Console.WriteLine($"  Skipped (empty): {fileName}");
+                WriteTrace(entry, "Skipped (empty file).");
                 return entry;
             }
 
-            var result = await _apiClient.SendDocumentAsync(content, cancellationToken);
+            var result = await SendWithRetryAsync(entry, content, cancellationToken);
             var apiResponse = DianResponseParser.Parse(result.ResponseBody);
 
             entry.RequestContentType = result.RequestContentType;
@@ -124,8 +143,8 @@ public sealed class DocumentProcessor
             entry.TrackId = apiResponse.TrackId;
             entry.Uuid = apiResponse.Uuid;
             entry.Success = result.IsSuccessStatusCode;
+            entry.Timestamp = DateTime.Now;
 
-            // Prefer document number from API when the ENR field was missing.
             if (string.IsNullOrWhiteSpace(entry.DocumentNumber)
                 && !string.IsNullOrWhiteSpace(apiResponse.DocumentNumber))
             {
@@ -139,8 +158,7 @@ public sealed class DocumentProcessor
                     : $"API returned HTTP {result.StatusCode}. {entry.ResponseMessage}";
 
                 await _logger.WriteAsync(entry, cancellationToken);
-                Console.WriteLine($"  Failed: HTTP {result.StatusCode} | NIT={entry.CompanyNit ?? "n/a"} | FAD05={entry.DocumentNumber ?? "n/a"}");
-                Console.WriteLine($"  Response message: {entry.ResponseMessage ?? entry.ResponseBody ?? "(empty)"}");
+                WriteTrace(entry, $"Failed HTTP {result.StatusCode}. {entry.ResponseMessage ?? entry.ResponseBody ?? string.Empty}");
                 return entry;
             }
 
@@ -149,9 +167,8 @@ public sealed class DocumentProcessor
             entry.ProcessedPath = destinationPath;
 
             await _logger.WriteAsync(entry, cancellationToken);
-            Console.WriteLine($"  Sent NIT={entry.CompanyNit ?? "n/a"} | FAD05={entry.DocumentNumber ?? "n/a"}");
-            Console.WriteLine($"  Response message: {entry.ResponseMessage ?? "(no StatusMessage in body)"}");
-            Console.WriteLine($"  Moved to: {destinationPath}");
+            WriteTrace(entry, $"Sent OK. {entry.ResponseMessage ?? "(no StatusMessage)"}");
+            WriteTrace(entry, $"Moved to: {destinationPath}");
             return entry;
         }
         catch (Exception ex)
@@ -166,12 +183,75 @@ public sealed class DocumentProcessor
             }
             catch (Exception logEx)
             {
-                Console.WriteLine($"  Failed to write log: {logEx.Message}");
+                WriteTrace(entry, $"Failed to write log: {logEx.Message}");
             }
 
-            Console.WriteLine($"  Error: {ex.Message}");
+            WriteTrace(entry, $"Error: {ex.Message}");
             return entry;
         }
+    }
+
+    /// <summary>
+    /// Sends the document and retries transient failures (429/503/408/timeouts/network).
+    /// </summary>
+    private async Task<ApiSendResult> SendWithRetryAsync(
+        DocumentLogEntry entry,
+        string content,
+        CancellationToken cancellationToken)
+    {
+        var maxAttempts = Math.Max(1, _processing.MaxRetryAttempts + 1);
+        var baseDelayMs = Math.Max(0, _processing.RetryBaseDelayMilliseconds);
+        Exception? lastException = null;
+
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                var result = await _apiClient.SendDocumentAsync(content, cancellationToken);
+
+                if (result.IsSuccessStatusCode || !IsTransientStatusCode(result.StatusCode) || attempt >= maxAttempts)
+                {
+                    return result;
+                }
+
+                var delay = TimeSpan.FromMilliseconds(baseDelayMs * attempt);
+                WriteTrace(entry, $"Transient HTTP {result.StatusCode}. Retry {attempt}/{maxAttempts - 1} in {delay.TotalSeconds:0.#}s.");
+                await Task.Delay(delay, cancellationToken);
+            }
+            catch (Exception ex) when (IsTransientException(ex) && attempt < maxAttempts)
+            {
+                lastException = ex;
+                var delay = TimeSpan.FromMilliseconds(baseDelayMs * attempt);
+                WriteTrace(entry, $"Transient error: {ex.Message}. Retry {attempt}/{maxAttempts - 1} in {delay.TotalSeconds:0.#}s.");
+                await Task.Delay(delay, cancellationToken);
+            }
+        }
+
+        if (lastException is not null)
+        {
+            throw lastException;
+        }
+
+        // Should not reach here; keep compiler happy.
+        return await _apiClient.SendDocumentAsync(content, cancellationToken);
+    }
+
+    private static bool IsTransientStatusCode(int statusCode)
+        => statusCode is 408 or 429 or 502 or 503 or 504;
+
+    private static bool IsTransientException(Exception ex)
+        => ex is HttpRequestException
+            or TaskCanceledException
+            or TimeoutException
+            || ex.InnerException is TimeoutException or TaskCanceledException;
+
+    private static void WriteTrace(DocumentLogEntry entry, string message)
+    {
+        var key = !string.IsNullOrWhiteSpace(entry.DocumentNumber)
+            ? entry.DocumentNumber
+            : entry.FileName;
+
+        Console.WriteLine($"[{key}] {message}");
     }
 
     private void EnsureFoldersExist()
@@ -208,35 +288,37 @@ public sealed class DocumentProcessor
 
     /// <summary>
     /// Builds a destination path that always keeps prior versions.
-    /// Every successful send is stored as {name}_{yyyyMMdd_HHmmss}.txt so reprocessing never overwrites.
+    /// Thread-safe so parallel workers never overwrite each other.
     /// </summary>
     private string GetUniqueDestinationPath(string fileName)
     {
-        var nameWithoutExtension = Path.GetFileNameWithoutExtension(fileName);
-        var extension = Path.GetExtension(fileName);
-        var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-
-        var destinationPath = Path.Combine(
-            _paths.ProcessedFolder,
-            $"{nameWithoutExtension}_{timestamp}{extension}");
-
-        if (!File.Exists(destinationPath))
+        lock (_processedPathLock)
         {
+            var nameWithoutExtension = Path.GetFileNameWithoutExtension(fileName);
+            var extension = Path.GetExtension(fileName);
+            var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+
+            var destinationPath = Path.Combine(
+                _paths.ProcessedFolder,
+                $"{nameWithoutExtension}_{timestamp}{extension}");
+
+            if (!File.Exists(destinationPath))
+            {
+                return destinationPath;
+            }
+
+            var counter = 1;
+            do
+            {
+                destinationPath = Path.Combine(
+                    _paths.ProcessedFolder,
+                    $"{nameWithoutExtension}_{timestamp}_{counter}{extension}");
+                counter++;
+            }
+            while (File.Exists(destinationPath));
+
             return destinationPath;
         }
-
-        // Same-second collision: append a counter to preserve every version.
-        var counter = 1;
-        do
-        {
-            destinationPath = Path.Combine(
-                _paths.ProcessedFolder,
-                $"{nameWithoutExtension}_{timestamp}_{counter}{extension}");
-            counter++;
-        }
-        while (File.Exists(destinationPath));
-
-        return destinationPath;
     }
 }
 

@@ -18,24 +18,33 @@ var reportFolder = string.IsNullOrWhiteSpace(settings.Paths.ReportFolder)
     ? settings.Paths.LogFolder
     : settings.Paths.ReportFolder;
 
+var httpTimeoutSeconds = Math.Max(30, settings.Processing.HttpTimeoutSeconds);
+
 var services = new ServiceCollection();
 services.AddSingleton(settings.Api);
 services.AddSingleton(settings.Paths);
+services.AddSingleton(settings.Processing);
 services.AddSingleton(new JsonFileLogger(settings.Paths.LogFolder));
 services.AddSingleton(new ExcelRunReportWriter(reportFolder));
-services.AddHttpClient<DianApiClient>();
+services.AddHttpClient<DianApiClient>(client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(httpTimeoutSeconds);
+});
 services.AddTransient<DocumentProcessor>();
 
 await using var provider = services.BuildServiceProvider();
 
 Console.WriteLine("Document Reprocessor");
-Console.WriteLine($"Endpoint    : {settings.Api.EndpointUrl}");
-Console.WriteLine($"Content-Type: {settings.Api.ContentType}");
-Console.WriteLine($"Wrap JSON   : {settings.Api.WrapBodyAsJsonString}");
-Console.WriteLine($"Input       : {settings.Paths.InputFolder}");
-Console.WriteLine($"Processed   : {settings.Paths.ProcessedFolder}");
-Console.WriteLine($"Logs        : {settings.Paths.LogFolder}");
-Console.WriteLine($"Reports     : {reportFolder}");
+Console.WriteLine($"Endpoint       : {settings.Api.EndpointUrl}");
+Console.WriteLine($"Content-Type   : {settings.Api.ContentType}");
+Console.WriteLine($"Wrap JSON      : {settings.Api.WrapBodyAsJsonString}");
+Console.WriteLine($"Parallelism    : {Math.Max(1, settings.Processing.MaxDegreeOfParallelism)}");
+Console.WriteLine($"Retries        : {Math.Max(0, settings.Processing.MaxRetryAttempts)}");
+Console.WriteLine($"HTTP timeout   : {httpTimeoutSeconds}s");
+Console.WriteLine($"Input          : {settings.Paths.InputFolder}");
+Console.WriteLine($"Processed      : {settings.Paths.ProcessedFolder}");
+Console.WriteLine($"Logs           : {settings.Paths.LogFolder}");
+Console.WriteLine($"Reports        : {reportFolder}");
 Console.WriteLine();
 
 var processor = provider.GetRequiredService<DocumentProcessor>();
@@ -67,5 +76,10 @@ static void ValidateSettings(AppSettings settings)
         || string.IsNullOrWhiteSpace(settings.Paths.LogFolder))
     {
         throw new InvalidOperationException("Paths:InputFolder, Paths:ProcessedFolder and Paths:LogFolder are required.");
+    }
+
+    if (settings.Processing.MaxDegreeOfParallelism < 1)
+    {
+        throw new InvalidOperationException("Processing:MaxDegreeOfParallelism must be >= 1.");
     }
 }
