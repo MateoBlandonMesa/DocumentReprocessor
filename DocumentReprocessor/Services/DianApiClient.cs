@@ -48,9 +48,6 @@ public sealed class DianApiClient
         content.Headers.TryAddWithoutValidation("Content-Type", mediaType);
         request.Content = content;
 
-        Console.WriteLine($"  Request Content-Type: {mediaType}");
-        Console.WriteLine($"  Request Content-Length: {content.Headers.ContentLength}");
-
         using var response = await _httpClient.SendAsync(request, cancellationToken);
         var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
 
