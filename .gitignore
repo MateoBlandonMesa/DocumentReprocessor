@@ -1,0 +1,15 @@
+# Visual Studio / IDE
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Build outputs (any project folder)
+**/bin/
+**/obj/
+**/publish/
+
+# Local secrets — keep appsettings.Example.json in source control
+DocumentReprocessor/appsettings.json
+DocumentReprocessor/appsettings.Development.json
